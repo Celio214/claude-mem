@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "claude-mem-fork",
+  "name": "claude-mem (Mon Fork)",
+  "version": "1.0.0",
+  "description": "Mémoire persistante synchronisée depuis mon fork.",
+  "icon": "🧠",
+  "entrypoint": "build/index.js",
+  "capabilities": ["mcp-proxy"]
+}
