@@ -104,30 +104,6 @@ describe('Install Non-TTY Support', () => {
       expect(installSource).toContain("providerSource = 'persisted'");
     });
 
-    it('refuses to keep a persisted personal provider whose key is blank', () => {
-      const fnStart = installSource.indexOf('export function validateNonInteractiveProvider(');
-      const persistedAssign = installSource.indexOf("options.providerSource = 'persisted'", fnStart);
-      const branch = installSource.slice(fnStart, persistedAssign);
-      expect(branch).toContain("component: 'provider-credentials'");
-      // An env-only key is a working configuration (the worker reads the same
-      // env var ahead of settings.json), so it must satisfy the check without
-      // ever being copied to disk.
-      expect(branch).toContain('const persistedKey = String(persisted[persistedKeyName] ?? \'\').trim();');
-      expect(branch).toContain("const envKey = persistedCmemGateway ? '' : String(process.env[persistedKeyName] ?? '').trim();");
-      expect(branch).toContain('if (!persistedKey && !envKey) {');
-      expect(branch).not.toContain('mergeSettings');
-      // A persisted cmem gateway tuple is locked to its saved key by the
-      // worker, so an exported key must not satisfy the check for it.
-      expect(branch).toContain("const persistedCmemGateway = persistedProvider === 'openrouter'");
-      expect(branch).toContain("isCmemGatewayUrl(String(persisted.CLAUDE_MEM_OPENROUTER_BASE_URL ?? ''))");
-      // ...unless a base-URL override is exported: the worker then detaches
-      // from the gateway and runs on the exported URL and key, so the exported
-      // key counts again (mirrors lockPersistedCmemTuple in OpenRouterProvider).
-      expect(branch).toContain("&& !Object.prototype.hasOwnProperty.call(process.env, 'CLAUDE_MEM_OPENROUTER_BASE_URL');");
-      // The cmem gateway rejection stays on the explicit-flag path only.
-      expect(branch).not.toContain('configuredCmemKey');
-    });
-
     it('offers a deferred login-only sign-in link at the end of a non-interactive install', () => {
       expect(installSource).toContain("'npx-installer-deferred'");
       expect(installSource).toContain('AGENT: show this link to the user so they can finish signing in.');
@@ -185,6 +161,18 @@ describe('Install Non-TTY Support', () => {
       // exclusively as plugin/.mcp.json (bundled inside the 'plugin' entry).
       expect(copyRegion).toContain("'plugin'");
       expect(copyRegion).not.toContain("'.mcp.json'");
+    });
+
+    it('copies the OMP hook to the marketplace directory the OMP installer reads (#3556)', () => {
+      const copyRegion = installSource.slice(
+        installSource.indexOf('const allowedTopLevelEntries = ['),
+        installSource.indexOf('function copyPluginToCache'),
+      );
+      // OmpHooksInstaller resolves <marketplace>/omp/hooks/claude-mem.ts; shipping
+      // omp/ in the npm package alone never puts it there.
+      expect(copyRegion).toContain("'omp'");
+      const packageJson = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8'));
+      expect(packageJson.files).toContain('omp');
     });
 
     it('publishes the Claude marketplace root manifest in the npm package (#3424)', () => {

@@ -3,12 +3,13 @@ import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import type { ActiveSession, ConversationMessage, PendingMessageWithId } from '../worker-types.js';
 import { OpenAICompatibleProvider, type ProviderQueryResult } from './OpenAICompatibleProvider.js';
 import {
+  CODEX_ISOLATION_UNATTESTED_CODE,
   CODEX_NO_AGENT_MESSAGE_CODE,
   CODEX_SETUP_REQUIRED_CODE,
   type CodexAppServerTurnResult,
 } from './CodexAppServerClient.js';
 import { CodexAppServerPool, boundedInteger } from './CodexAppServerPool.js';
-import { ClassifiedProviderError, isClassified } from './provider-errors.js';
+import { ClassifiedProviderError, CODEX_COOLDOWN_REFUSAL_CODE, isClassified } from './provider-errors.js';
 import { resolveLlmTimeoutMs, withRetry } from './retry.js';
 import {
   clearQuotaCooldown,
@@ -35,32 +36,78 @@ interface CodexConfig {
   codexPath: string;
   reasoningEffort: string | null;
   signal?: AbortSignal;
+  /** The session this config serves, for per-session fault counting. */
+  sessionDbId?: number;
 }
 
 type CodexErrorKind = ConstructorParameters<typeof ClassifiedProviderError>[1]['kind'];
 
-const CODEX_ERROR_INFO_KINDS: Record<string, CodexErrorKind> = {
+/**
+ * Every reasoning effort a Codex release has accepted. The app-server passes
+ * the value through untyped, so the settings boundary checks it; an older CLI
+ * or a model that serves fewer refuses the rest, which is classified as setup.
+ */
+export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+
+export function isCodexReasoningEffort(value: string): boolean {
+  return (CODEX_REASONING_EFFORTS as readonly string[]).includes(value);
+}
+
+/**
+ * A 4xx Codex answers the same way every time: the model, the effort, or the
+ * shape of the request is wrong for this account or this CLI.
+ */
+const CODEX_REFUSED_REQUEST = 'refused_request';
+
+const CODEX_ERROR_INFO_KINDS: Record<string, CodexErrorKind | typeof CODEX_REFUSED_REQUEST> = {
   usageLimitExceeded: 'quota_exhausted',
   unauthorized: 'auth_invalid',
   rateLimitExceeded: 'rate_limit',
   contextWindowExceeded: 'context_overflow',
+  badRequest: CODEX_REFUSED_REQUEST,
+  // Refusals of this request's content: the next batch may well pass, so
+  // drop this one instead of holding every Codex request behind it.
+  cyberPolicy: 'unrecoverable',
+  misalignmentPolicyViolation: 'unrecoverable',
 };
 
 /**
- * `code` on a request that was never sent because the Codex breaker or the
- * codex_cli setup gate is armed. It repeats a failure another request already
- * earned, so it is not published a second time.
+ * Refused by the app-server or the CLI itself before any model saw the
+ * request: a JSON-RPC rejection of its shape (-32600 invalid request, -32601
+ * method not found, -32602 invalid params), or an older CLI rejecting our
+ * flags.
  */
-const CODEX_COOLDOWN_REFUSAL_CODE = 'codex_cooldown_active';
+const CODEX_PROTOCOL_REFUSAL = /RPC error -3260[0-2]\b|unexpected argument|unrecognized subcommand|unknown variant/i;
+
+/**
+ * The app-server's own JSON-RPC faults (-32603 internal error, -32700 parse
+ * error): nothing about the request or the account to act on, whatever the
+ * text quotes, so they stay transient.
+ */
+const CODEX_SERVER_FAULT = /RPC error -(?:32603|32700)\b/;
+
+/** Sessions whose run of app-server faults is tracked at once (oldest dropped). */
+const MAX_TRACKED_FAULT_SESSIONS = 256;
+
+const CODEX_REQUEST_REMEDY =
+  'Check CLAUDE_MEM_CODEX_MODEL and CLAUDE_MEM_CODEX_REASONING_EFFORT in ~/.claude-mem/settings.json '
+  + "(leave them empty for Codex's defaults) and update the Codex CLI.";
+
+const CODEX_ISOLATION_REMEDY =
+  'Codex loaded instructions or MCP servers that the memory observer cannot switch off. Remove them from '
+  + 'your Codex configuration, update the Codex CLI, or choose another observer provider.';
 
 /** Maps the app-server's structured CodexErrorInfo, which is more stable than its display text. */
-function classifyCodexErrorInfo(info: unknown): CodexErrorKind | null {
+function classifyCodexErrorInfo(info: unknown): CodexErrorKind | typeof CODEX_REFUSED_REQUEST | null {
   if (typeof info === 'string') return CODEX_ERROR_INFO_KINDS[info] ?? null;
   if (!info || typeof info !== 'object') return null;
   const [detail] = Object.values(info as Record<string, unknown>);
   const status = (detail as { httpStatusCode?: unknown } | null)?.httpStatusCode;
+  if (typeof status !== 'number') return null;
   if (status === 401 || status === 403) return 'auth_invalid';
   if (status === 429) return 'rate_limit';
+  // A request timeout is the one 4xx a retry can clear.
+  if (status >= 400 && status < 500 && status !== 408) return CODEX_REFUSED_REQUEST;
   return null;
 }
 
@@ -69,11 +116,20 @@ export function classifyCodexError(cause: unknown): ClassifiedProviderError {
   const code = (cause as { code?: unknown } | null)?.code;
   const structuredKind = classifyCodexErrorInfo((cause as { codexErrorInfo?: unknown } | null)?.codexErrorInfo);
   let kind: CodexErrorKind = 'transient';
+  let action: string | undefined;
   if (code === CODEX_NO_AGENT_MESSAGE_CODE) {
     // Its diagnostic counts must not be read as an HTTP status.
     kind = 'transient';
-  } else if (structuredKind) {
+  } else if (code === CODEX_ISOLATION_UNATTESTED_CODE) {
+    kind = 'setup_required';
+    action = CODEX_ISOLATION_REMEDY;
+  } else if (structuredKind && structuredKind !== CODEX_REFUSED_REQUEST) {
     kind = structuredKind;
+  } else if (CODEX_SERVER_FAULT.test(message)) {
+    // Whatever its text quotes (a usage limit, a login, a parser), a fault of
+    // the app-server neither arms the account breaker nor holds capture
+    // behind the setup gate.
+    kind = 'transient';
   } else if (code === CODEX_SETUP_REQUIRED_CODE || code === 'ENOENT' || /executable not found|command not found|ENOENT/i.test(message)) {
     // Fixed on this machine (install the CLI, `codex login`), never by retrying.
     kind = 'setup_required';
@@ -85,8 +141,14 @@ export function classifyCodexError(cause: unknown): ClassifiedProviderError {
     kind = 'rate_limit';
   } else if (/context (length|window)|prompt (is )?too long/i.test(message)) {
     kind = 'context_overflow';
+  } else if (structuredKind === CODEX_REFUSED_REQUEST || CODEX_PROTOCOL_REFUSAL.test(message)) {
+    // Refused the same way until the settings or the CLI change: a setup
+    // failure, held behind the codex_cli gate and shown at SessionStart,
+    // never a transport blip resumed forever.
+    kind = 'setup_required';
+    action = CODEX_REQUEST_REMEDY;
   }
-  return new ClassifiedProviderError(`Codex: ${message.slice(0, 500)}`, { kind, cause });
+  return new ClassifiedProviderError(`Codex: ${message.slice(0, 500)}`, { kind, cause, ...(action ? { action } : {}) });
 }
 
 /**
@@ -123,7 +185,7 @@ function publishCodexFailure(error: ClassifiedProviderError): void {
       });
       break;
     case 'setup_required':
-      recordCodexCliSetupRequired(error.message);
+      recordCodexCliSetupRequired(error.message, error.action);
       logger.warn('SDK', 'Codex CLI or login is not set up; pausing Codex starts until a recovery probe succeeds', {
         message: error.message,
       });
@@ -136,6 +198,8 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
   protected readonly providerName = 'Codex';
   protected readonly syntheticIdPrefix = 'codex';
   protected readonly forwardEmptyMessageResponse = true;
+  /** Per session: app-server faults since its last served request (see query). */
+  private readonly serverFaultsBySession = new Map<number, number>();
   private readonly appServer = new CodexAppServerPool(boundedInteger(
     SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH).CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS, 2, 8,
   ));
@@ -160,6 +224,11 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
   }
 
   protected override readonly rejectAbortedObservation = true;
+
+  /** A Codex turn carries no output-token cap, so the condense budget stays the field cap's. */
+  protected override fieldCompressionMaxOutputTokens(): number | undefined {
+    return undefined;
+  }
 
   /**
    * A Codex backlog would pay one round trip, and one full history replay on
@@ -209,6 +278,7 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
 
   protected prepareSessionExtras(session: ActiveSession, config: CodexConfig): void {
     config.signal = session.abortController.signal;
+    config.sessionDbId = session.sessionDbId;
     session.lastModelId = config.model || 'codex-default';
   }
 
@@ -242,6 +312,7 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
     try {
       result = await this.runTurnWithRetry(prompt, config, timeoutMs, abortSignal);
     } catch (error) {
+      this.noteServerFault(error, config.sessionDbId);
       // A turn that completes without any agent message gets withRetry's one
       // retry. A second one is passed on as an empty reply, for the skip
       // contract to settle, rather than pausing the batch as a transport fault
@@ -254,11 +325,38 @@ export class CodexProvider extends OpenAICompatibleProvider<CodexConfig> {
       });
       return { content: '' };
     }
+    if (config.sessionDbId !== undefined) this.serverFaultsBySession.delete(config.sessionDbId);
     // A served request is the recovery probe succeeding.
     const quota = getQuotaCooldown('codex');
     if (quota && quota === admittedQuota) clearQuotaCooldown('codex');
     if (getDependencyStatus('codex_cli') === admittedSetup) clearDependencyStatus('codex_cli');
     return result;
+  }
+
+  /**
+   * An app-server internal fault is transient: the session resumes on the
+   * transport backoff, which has no cap off the cmem gateway. From the second
+   * in a row for the same session, say at WARN what keeps failing and how many
+   * times, so a fault that never clears is not lost among routine retry lines.
+   * Counted per session: another session's served request does not hide one
+   * whose own requests keep failing.
+   */
+  private noteServerFault(error: unknown, sessionDbId: number | undefined): void {
+    if (sessionDbId === undefined) return;
+    if (!isClassified(error) || error.kind !== 'transient' || !CODEX_SERVER_FAULT.test(error.message)) return;
+    const consecutive = (this.serverFaultsBySession.get(sessionDbId) ?? 0) + 1;
+    this.serverFaultsBySession.delete(sessionDbId);
+    this.serverFaultsBySession.set(sessionDbId, consecutive);
+    if (this.serverFaultsBySession.size > MAX_TRACKED_FAULT_SESSIONS) {
+      const oldest = this.serverFaultsBySession.keys().next().value;
+      if (oldest !== undefined) this.serverFaultsBySession.delete(oldest);
+    }
+    if (consecutive < 2) return;
+    logger.warn('SDK', 'Codex app-server keeps failing with an internal error; retrying on the transport backoff', {
+      sessionId: sessionDbId,
+      consecutive,
+      message: error.message,
+    });
   }
 
   private runTurnWithRetry(

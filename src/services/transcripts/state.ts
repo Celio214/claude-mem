@@ -5,6 +5,29 @@ import { writeJsonFileAtomic } from '../../shared/atomic-json.js';
 
 export interface TranscriptWatchState {
   offsets: Record<string, number>;
+  /**
+   * zstd files only: the unterminated JSONL prefix a durable offset has
+   * advanced past. zstd frames are only resumable at frame boundaries, so when
+   * a frame ends in the middle of a JSONL record the prefix must survive a
+   * watcher restart or the completed record is never assembled. (A JSONL
+   * checkpoint simply stops before its partial record.) Older state files
+   * predate this field and simply have no partials.
+   */
+  partials?: Record<string, string>;
+  /**
+   * zstd files only: how many lines of the frame at the offset were already
+   * dispatched when a turn later in that frame failed. The retry, in this
+   * process or after a restart, resumes at the failed line, not at the frame
+   * start.
+   */
+  frameLines?: Record<string, number>;
+  /**
+   * The working directory each file's session last reported. Some hosts write
+   * it only on a session's first line (DeepSeek Harness), and a restarted
+   * watcher resumes past that line, so it is kept here. Older state files
+   * have none.
+   */
+  cwds?: Record<string, string>;
 }
 
 export function loadWatchState(statePath: string): TranscriptWatchState {

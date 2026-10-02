@@ -171,6 +171,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_OPENROUTER_SITE_URL: string;
   CLAUDE_MEM_OPENROUTER_APP_NAME: string;
   CLAUDE_MEM_OPENROUTER_EXTRA_BODY: string;
+  CLAUDE_MEM_OPENROUTER_REASONING_EFFORT: string;
   CLAUDE_MEM_OPENAI_COMPAT_PRESET: string;
   CLAUDE_MEM_OPENAI_COMPAT_API_KEY: string;
   CLAUDE_MEM_OPENAI_COMPAT_API_KEYS: string;
@@ -206,6 +207,7 @@ export interface SettingsDefaults {
   CLAUDE_MEM_TRANSCRIPTS_ENABLED: string;  
   CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH: string;  
   CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION: string;
+  CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: string;
   CLAUDE_MEM_MAX_CONCURRENT_AGENTS: string;  
   CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: string;
   CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: string;  // Observer model context window in tokens; '' = resolve automatically
@@ -367,7 +369,7 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_PROVIDER: 'claude',
     CLAUDE_MEM_CODEX_MODEL: '', // Empty uses the Codex default model.
     CLAUDE_MEM_CODEX_PATH: 'codex',
-    CLAUDE_MEM_CODEX_REASONING_EFFORT: '',
+    CLAUDE_MEM_CODEX_REASONING_EFFORT: 'low',
     CLAUDE_MEM_CODEX_MAX_CONCURRENT_AGENTS: '2',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_SIZE: '8',
     CLAUDE_MEM_CODEX_OBSERVATION_BATCH_MAX_CHARS: '32000',
@@ -391,6 +393,7 @@ export class SettingsDefaultsManager {
     // JSON object of provider-specific request fields, e.g. {"reasoning":{"enabled":false}}.
     // Settings file or env only (never the HTTP settings API); never sent to the cmem gateway.
     CLAUDE_MEM_OPENROUTER_EXTRA_BODY: '',
+    CLAUDE_MEM_OPENROUTER_REASONING_EFFORT: '',  // none | minimal | low | medium | high. Empty sends nothing. openrouter.ai only.
     CLAUDE_MEM_OPENAI_COMPAT_PRESET: '',  // Named endpoint preset for the openai-compatible provider (nvidia-nim, deepseek, groq, together, vllm, ollama, lmstudio). Empty = 'custom', configure the base URL by hand.
     CLAUDE_MEM_OPENAI_COMPAT_API_KEY: '',  // Key for the openai-compatible provider. Never shares the OpenRouter key or its attribution headers.
     CLAUDE_MEM_OPENAI_COMPAT_API_KEYS: '',  // Optional extra keys (newline/comma separated) for the openai-compatible provider.
@@ -424,6 +427,10 @@ export class SettingsDefaultsManager {
     CLAUDE_MEM_TRANSCRIPTS_ENABLED: 'true',
     CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH: join(homedir(), '.claude-mem', 'transcript-watch.json'),
     CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION: 'false',
+    // Codex subagent rollouts through the transcript watch: each one's tool
+    // calls are new observer spend (the gateway allowance, or the user's own
+    // plan), so capture is opt-in (Wave 3 gate R4-5).
+    CLAUDE_MEM_CODEX_SUBAGENT_INGESTION: 'false',
     CLAUDE_MEM_MAX_CONCURRENT_AGENTS: '2',  // Max concurrent Claude SDK agent subprocesses
     CLAUDE_MEM_OBSERVER_MAX_CONVERSATION_CHARS: '400000',  // Retire an observer conversation past this size and start a fresh generation (#3800)
     CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW: '',  // Observer model context window in tokens; '' = resolve it (OpenRouter catalogue, Gemini/Claude maps). Lowers the budget above to half the window (#3625)

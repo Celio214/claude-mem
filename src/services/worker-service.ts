@@ -122,8 +122,9 @@ import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
 import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
 import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
-import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, filterNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
+import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, scopeNativeHookBackedCodexWatches, loadTranscriptWatchConfig } from './transcripts/config.js';
 import { TranscriptWatcher } from './transcripts/watcher.js';
+import { runMemoryCommand } from './memory/cli.js';
 import { SyncApply } from './sync/SyncApply.js';
 import { SyncClient } from './sync/SyncClient.js';
 
@@ -135,6 +136,7 @@ import { SearchRoutes } from './worker/http/routes/SearchRoutes.js';
 import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
 import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
+import { MemoryIngestRoutes } from './worker/http/routes/MemoryIngestRoutes.js';
 import { DedupRoutes } from './worker/http/routes/DedupRoutes.js';
 import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
 import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
@@ -472,6 +474,7 @@ export class WorkerService implements WorkerRef {
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
     this.server.registerRoutes(new MemoryRoutes(this.dbManager, 'claude-mem'));
+    this.server.registerRoutes(new MemoryIngestRoutes(this.dbManager));
     this.server.registerRoutes(new DedupRoutes(this.dbManager));
     this.server.registerRoutes(new ServerV1Routes({
       getDatabase: () => this.dbManager.getConnection(),
@@ -906,17 +909,23 @@ export class WorkerService implements WorkerRef {
       return;
     }
 
-    const allowCodexTranscriptIngestion = settings.CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION === 'true';
-    const { config: transcriptConfig, removed } = filterNativeHookBackedCodexWatches(
+    const { config: transcriptConfig, scoped, removed } = scopeNativeHookBackedCodexWatches(
       loadTranscriptWatchConfig(configPath),
-      allowCodexTranscriptIngestion
+      settings,
     );
     const statePath = expandHomePath(transcriptConfig.stateFile ?? DEFAULT_STATE_PATH);
 
+    if (scoped > 0) {
+      logger.info('TRANSCRIPT', 'Scoped Codex transcript watch to subagent sessions; native hooks own top-level sessions', {
+        scoped,
+        enabledBy: 'CLAUDE_MEM_CODEX_SUBAGENT_INGESTION=true',
+        skipSetting: 'CLAUDE_MEM_SKIP_SUBAGENT_OBSERVATIONS=true',
+      });
+    }
     if (removed > 0) {
-      logger.warn('TRANSCRIPT', 'Skipped Codex transcript watch because native Codex hooks are authoritative', {
+      logger.info('TRANSCRIPT', 'Skipped Codex transcript watch: native hooks own top-level sessions; Codex subagent capture is opt-in', {
         removed,
-        optInSetting: 'CLAUDE_MEM_CODEX_TRANSCRIPT_INGESTION=true',
+        subagentOptInSetting: 'CLAUDE_MEM_CODEX_SUBAGENT_INGESTION=true',
       });
     }
 
@@ -1528,6 +1537,15 @@ async function main() {
       const subcommand = process.argv[3];
       const cursorResult = await handleCursorCommand(subcommand, process.argv.slice(4));
       process.exit(cursorResult);
+      break;
+    }
+
+    case 'memory': {
+      // Auto-memory ingest (sibling to transcript). Dry-run runs client-side;
+      // the real store reaches the worker over HTTP from inside runMemoryCommand.
+      const subcommand = process.argv[3];
+      const memoryResult = await runMemoryCommand(subcommand, process.argv.slice(4));
+      process.exit(memoryResult);
       break;
     }
 

@@ -25,9 +25,9 @@ import {
   resolveConversationMaxChars,
   windowAwareConversationMaxChars,
 } from '../../shared/observer-recycle.js';
-import { resolveContextWindowTokens, observationFieldMaxChars } from './context-window.js';
+import { resolveContextWindowTokens, observationFieldMaxChars, resolveObserverMaxOutputTokens } from './context-window.js';
 import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration } from './session/recycle-conversation.js';
-import { optimizeObservationFields, buildFieldCompressionPrompt } from './field-optimizer.js';
+import { optimizeObservationFields, buildFieldCompressionPrompt, type CompressedField } from './field-optimizer.js';
 import { resolveFieldOptimizeTimeoutMs } from './retry.js';
 import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '../integrations/TelegramWrapupNotifier.js';
 
@@ -164,7 +164,7 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     config: TConfig,
     signal: AbortSignal,
     deadlineMs?: number,
-  ): Promise<string | null> {
+  ): Promise<CompressedField | null> {
     // The field pass races `deadlineMs` (CLAUDE_MEM_FIELD_OPTIMIZE_TIMEOUT_MS).
     // Without it the request keeps the LLM per-attempt default, and a longer
     // field knob would never take effect on this path (#4134).
@@ -174,7 +174,18 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       signal,
       deadlineMs,
     );
-    return result.content || null;
+    if (!result.content) return null;
+    return { text: result.content, truncated: result.finishReason === 'length' || result.finishReason === 'MAX_TOKENS' };
+  }
+
+  /**
+   * The output-token cap a field-compression request is sent with, so the
+   * condense prompt never asks for more than it can carry. The HTTP providers
+   * send CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS on every request; one that sends
+   * no cap returns undefined and keeps the field-cap budget.
+   */
+  protected fieldCompressionMaxOutputTokens(): number | undefined {
+    return resolveObserverMaxOutputTokens();
   }
 
   /** Format a stored summary through this provider's normal summary-model query path. */
@@ -340,7 +351,11 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
     // conversation that starts partway through (a recycle, or a resume after a
     // quota pause) continues from the memory rather than from nothing (#3800).
     const priorContext = await loadSessionStartContext(session);
-    const initPrompt = session.lastPromptNumber === 1
+    // Prompt 0 means no user_prompts row exists for this session (a
+    // transcript-ingested turn with no anchor). Treat it, like the genuine
+    // first prompt, as an init rather than an empty continuation the model
+    // rejects as prose (#3653).
+    const initPrompt = session.lastPromptNumber <= 1
       ? buildInitPrompt(session.project, session.contentSessionId, session.userPrompt, mode, priorContext)
       : buildContinuationPrompt(session.userPrompt, session.lastPromptNumber, session.contentSessionId, mode, priorContext);
 
@@ -491,6 +506,8 @@ export abstract class OpenAICompatibleProvider<TConfig extends { apiKey: string;
       { sessionDbId: session.sessionDbId, toolName: message.tool_name },
       fieldMaxChars,
       resolveFieldOptimizeTimeoutMs,
+      session.observerContextWindowTokens,
+      () => this.fieldCompressionMaxOutputTokens(),
     );
 
     const obsPrompt = buildObservationPromptParts({

@@ -22,6 +22,7 @@ import { MEDIA_PROMPT_PLACEHOLDER } from '../../../sqlite/prompt-storage.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH, ensureObserverSessionsDir } from '../../../../shared/paths.js';
 import { getProjectContext, isProjectKeySource } from '../../../../utils/project-name.js';
+import { isProjectExcluded } from '../../../../utils/project-filter.js';
 import { startGeneratorWithProvider } from '../../session/GeneratorRunner.js';
 import { captureEvent } from '../../../telemetry/telemetry.js';
 import { firstPartySkillFromSlashPrompt } from '../../../telemetry/skill-id.js';
@@ -35,6 +36,7 @@ import {
   isDependencyStatusInCooldown,
   recordClaudeCliSetupRequired,
 } from '../../../../shared/dependency-health.js';
+import { executableFingerprint } from '../../../../shared/executable-fingerprint.js';
 import { findClaudeExecutable, isClaudeExecutableUnspawnable } from '../../../../shared/find-claude-executable.js';
 import {
   tryAdmitQuotaProbe,
@@ -294,7 +296,23 @@ export class SessionRoutes extends BaseRouteHandler {
           }
 
           try {
-            findClaudeExecutable('SDK');
+            const resolvedPath = findClaudeExecutable('SDK');
+            // A spawn failure recorded the executable it could not launch (a
+            // .cmd/.bat shim passes discovery but not the SDK's spawn). While
+            // discovery still resolves that same, unchanged file, a start would
+            // fail the same way: keep skipping. A repair in place (reinstalling
+            // over the same path) changes the fingerprint and gets one start.
+            if (claudeStatus.executablePath === resolvedPath
+              && claudeStatus.executableFingerprint === executableFingerprint(resolvedPath)) {
+              recordClaudeCliSetupRequired(claudeStatus.message, resolvedPath);
+              logger.warn('SESSION', 'Claude executable still cannot be launched; skipping until it changes', {
+                sessionId: sessionDbId,
+                source,
+                executablePath: resolvedPath,
+              });
+              releaseCmemGatewayProbe(selection.gatewayProbeClaimId);
+              return;
+            }
             clearDependencyStatus('claude_cli');
             clearClaudeCliSelfHealAttempts();
             logger.info('SESSION', 'Claude setup dependency repaired; resuming generator start', {
@@ -623,6 +641,8 @@ export class SessionRoutes extends BaseRouteHandler {
     platformSource: z.string().optional(),
     observedModel: z.string().min(1).max(200).optional(),
     observedBilling: z.string().min(1).max(40).optional(),
+    // The checkout, from hosts that cannot check exclusions themselves.
+    cwd: z.string().optional(),
   }).passthrough();
 
   private static readonly sessionEndSchema = z.object({
@@ -688,7 +708,28 @@ export class SessionRoutes extends BaseRouteHandler {
 
     const store = this.dbManager.getSessionStore();
 
-    const sessionDbId = store.createSDKSession(contentSessionId, '', '', undefined, platformSource);
+    // Summarize only a session the worker knows. Creating a row here gave every
+    // idle turn of a session nothing else recorded (an excluded checkout, a
+    // skipped init) an empty-project row and a paid observer call (R5-1).
+    const sessionDbId = store.findSessionDbIdByContentSessionId(contentSessionId, platformSource);
+    if (sessionDbId === null) {
+      res.json({ status: 'skipped', reason: 'unknown_session' });
+      return;
+    }
+
+    // An excluded checkout is never summarized, even one excluded after its
+    // session began (R5-1). A host that cannot check the user's exclusions
+    // itself sends its checkout; without one, the checkout the session was
+    // recorded in is checked.
+    const requestCwd = typeof req.body.cwd === 'string' ? req.body.cwd.trim() : '';
+    const checkoutCwd = requestCwd || store.getSessionCwd(sessionDbId);
+    if (checkoutCwd) {
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      if (isProjectExcluded(checkoutCwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
+        res.json({ status: 'skipped', reason: 'project_excluded' });
+        return;
+      }
+    }
 
     if (observedModel || observedBilling) {
       store.setSessionObservedMetadata(sessionDbId, observedModel, observedBilling);
@@ -767,6 +808,15 @@ export class SessionRoutes extends BaseRouteHandler {
     // the key itself sends `project` and `projectKeySource`, and those win.
     const checkoutCwd = typeof req.body.cwd === 'string' ? req.body.cwd : '';
     const checkoutContext = !req.body.project && checkoutCwd.trim() ? getProjectContext(checkoutCwd) : null;
+    // Such a host cannot check the user's project exclusions either (the CLI
+    // hooks do, before they call): skip before any session row exists.
+    if (checkoutContext) {
+      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+      if (isProjectExcluded(checkoutCwd, settings.CLAUDE_MEM_EXCLUDED_PROJECTS)) {
+        res.json({ skipped: true, reason: 'project_excluded' });
+        return;
+      }
+    }
     const project = req.body.project || checkoutContext?.primary || 'unknown';
     const projectKeySource = checkoutContext ? checkoutContext.keySource : req.body.projectKeySource;
 

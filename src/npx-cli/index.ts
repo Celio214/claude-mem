@@ -24,8 +24,8 @@ ${styleText('bold', 'Install Commands')} (no Bun required):
   ${styleText('cyan', 'npx claude-mem')}                     Interactive install
   ${styleText('cyan', 'npx claude-mem install')}              Interactive install
   ${styleText('cyan', 'npx claude-mem install --ide <id>')}   Install for specific IDE
-  ${styleText('cyan', 'npx claude-mem install --provider claude|gemini|openrouter|host')}   Set LLM provider (optional non-interactively; a fresh install defaults to claude)
-  ${styleText('cyan', 'npx claude-mem install --model <id>')}   Set Claude model (when provider=claude)
+  ${styleText('cyan', 'npx claude-mem install --provider claude|codex|gemini|openrouter|host')}   Set LLM provider (optional non-interactively; a fresh install defaults to claude)
+  ${styleText('cyan', 'npx claude-mem install --model <id>')}   Set Claude or Codex model (when provider=claude|codex)
   ${styleText('cyan', 'npx claude-mem install --no-auto-start')}   Skip worker auto-start at the end
   ${styleText('cyan', 'npx claude-mem install --disable-auto-memory')}   Explicitly disable Claude Code native auto-memory
   ${styleText('cyan', 'npx claude-mem install --runtime worker|server')}   Select runtime non-interactively (server brings up Docker pg+redis, generates an API key, injects the IDE MCP config)
@@ -60,7 +60,7 @@ ${styleText('bold', 'Runtime Commands')} (requires Bun, delegates to installed p
   ${styleText('cyan', 'npx claude-mem kimi install|status|uninstall')}   Manage Kimi Code CLI hooks + MCP config
 
 ${styleText('bold', 'IDE Identifiers')}:
-  claude-code, cursor, grok-bot, opencode, openclaw,
+  claude-code, cursor, grok-bot, opencode, openclaw, omp,
   windsurf, codex-cli, kimi, copilot-cli, antigravity, goose,
   roo-code, warp
 `);
@@ -84,8 +84,8 @@ function parseInstallOptions(argv: string[]): InstallOptions {
   const flag = (name: string): string | undefined =>
     typeof values[name] === 'string' ? (values[name] as string) : undefined;
   const provider = flag('provider');
-  if (provider !== undefined && provider !== 'claude' && provider !== 'gemini' && provider !== 'openrouter' && provider !== 'host') {
-    console.error(`Unknown --provider: ${provider}. Allowed: claude, gemini, openrouter, host`);
+  if (provider !== undefined && provider !== 'claude' && provider !== 'codex' && provider !== 'gemini' && provider !== 'openrouter' && provider !== 'host') {
+    console.error(`Unknown --provider: ${provider}. Allowed: claude, codex, gemini, openrouter, host`);
     process.exit(1);
   }
   const runtime = flag('runtime');
@@ -275,6 +275,19 @@ async function main(): Promise<void> {
       } else {
         console.error(styleText('red', `Unknown transcript subcommand: ${subCommand ?? '(none)'}`));
         console.error(`Usage: npx claude-mem transcript watch`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'memory': {
+      const subCommand = args[1]?.toLowerCase();
+      if (subCommand === 'ingest') {
+        const { runMemoryIngestCommand } = await import('./commands/runtime.js');
+        runMemoryIngestCommand(args.slice(2));
+      } else {
+        console.error(styleText('red', `Unknown memory subcommand: ${subCommand ?? '(none)'}`));
+        console.error(`Usage: npx claude-mem memory ingest [--source <dir> | --all] [--dry-run] [--require-cwd]`);
         process.exit(1);
       }
       break;

@@ -265,6 +265,7 @@ export class SessionStore {
     this.ensureProjectNocaseIndexes();
     this.ensureAdvisorCallsTable();
     this.ensureSessionProjectKeySourceColumn();
+    this.requeuePromptsDeadLetteredForSize();
   }
 
   private getIndexColumns(indexName: string): string[] {
@@ -2052,6 +2053,38 @@ export class SessionStore {
     );
   }
 
+  // v60 — re-queue prompts dead-lettered for size before #3537's clamp. A
+  // prompt whose canonical body passed CONTENT_BODY_MAX_BYTES was quarantined
+  // (synced_at = -1 plus a sync_dead_letter row), and the drain reads
+  // synced_at IS NULL only, so it never synced again. The drain now bounds
+  // prompt_text (prompt-text-clamp.ts), so those prompts fit: re-null them
+  // and drop their size dead-letter rows, once. Native rows only; a prompt
+  // quarantined for any other reason keeps its quarantine.
+  private requeuePromptsDeadLetteredForSize(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(60);
+    if (applied) return;
+    const sizeReason = "canonical content: body exceeds % UTF-8 bytes";
+    this.db.transaction(() => {
+      const requeued = this.db.prepare(`
+        UPDATE user_prompts SET synced_at = NULL
+        WHERE synced_at = -1 AND origin_device_id IS NULL
+          AND CAST(id AS TEXT) IN (
+            SELECT origin_local_id FROM sync_dead_letter
+            WHERE lane = 'content' AND kind = 'prompt' AND reason LIKE ?
+          )
+      `).run(sizeReason);
+      this.db.prepare(`
+        DELETE FROM sync_dead_letter WHERE lane = 'content' AND kind = 'prompt' AND reason LIKE ?
+      `).run(sizeReason);
+      if (requeued.changes > 0) {
+        logger.info('DB', 'Re-queued prompts quarantined for size before the cloud-sync prompt clamp', {
+          prompts: requeued.changes,
+        });
+      }
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(60, new Date().toISOString());
+    })();
+  }
+
   // v59 — sdk_sessions.project_key_source: how the session's project key was
   // derived ('path' | 'git-remote' | 'environment'), recorded with its checkout
   // (cwd). Worktree adoption treats a checkout that no longer exists as a
@@ -3325,6 +3358,14 @@ export class SessionStore {
     ).run(cwd, projectKeySource ?? null, sessionDbId);
   }
 
+  /** The checkout the session was launched in, or null when none was recorded. */
+  getSessionCwd(sessionDbId: number): string | null {
+    const row = this.db.prepare('SELECT cwd FROM sdk_sessions WHERE id = ?').get(sessionDbId) as
+      | { cwd: string | null }
+      | null;
+    return row?.cwd ?? null;
+  }
+
   /**
    * Custom-title mutation op (plan Phase 3 task 2). sdk_sessions rows do not
    * sync, so there is no sync_rev to bump and no synced_at to null — the
@@ -3595,6 +3636,12 @@ export class SessionStore {
     observationIds: number[];
     /** Parallel to observationIds: true where a Tier-0 merge reused an existing row (nothing new was stored). */
     mergedIntoExisting: boolean[];
+    /**
+     * The rows this call actually inserted: not exact duplicates or Tier-0
+     * merges, which are earlier turns' rows. Only these may take a later
+     * correction to this turn's discovery_tokens.
+     */
+    insertedObservationIds: number[];
     summaryId: number | null;
     createdAtEpoch: number;
   } {
@@ -3616,6 +3663,7 @@ export class SessionStore {
     const storeTx = this.db.transaction(() => {
       const observationIds: number[] = [];
       const mergedIntoExisting: boolean[] = [];
+      const insertedObservationIds: number[] = [];
 
       const obsStmt = this.db.prepare(`
         INSERT INTO observations
@@ -3698,6 +3746,7 @@ export class SessionStore {
           if (dedup.enabled) this.maintainDedupOnInsert(project, inserted.id, observation.title, dedup);
           observationIds.push(inserted.id);
           mergedIntoExisting.push(false);
+          insertedObservationIds.push(inserted.id);
           continue;
         }
 
@@ -3745,10 +3794,28 @@ export class SessionStore {
         summaryId = Number(result.lastInsertRowid);
       }
 
-      return { observationIds, mergedIntoExisting, summaryId, createdAtEpoch: timestampEpoch };
+      return { observationIds, mergedIntoExisting, insertedObservationIds, summaryId, createdAtEpoch: timestampEpoch };
     });
 
     return storeTx();
+  }
+
+  /**
+   * Set discovery_tokens on rows a turn stored, after the fact. The Claude path
+   * derives it from the turn's streamed assistant frames, which a gateway that
+   * synthesizes streaming reports with zero input tokens (#3664); the turn's
+   * result message carries the real usage. Callers pass only rows the turn
+   * inserted, never ones it merged into from earlier turns.
+   */
+  updateDiscoveryTokens(observationIds: number[], summaryId: number | null, discoveryTokens: number): void {
+    if (observationIds.length === 0 && summaryId === null) return;
+    this.db.transaction(() => {
+      const observationStmt = this.db.prepare('UPDATE observations SET discovery_tokens = ? WHERE id = ?');
+      for (const id of observationIds) observationStmt.run(discoveryTokens, id);
+      if (summaryId !== null) {
+        this.db.prepare('UPDATE session_summaries SET discovery_tokens = ? WHERE id = ?').run(discoveryTokens, summaryId);
+      }
+    })();
   }
 
   getSessionSummariesByIds(

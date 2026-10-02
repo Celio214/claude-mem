@@ -32,7 +32,7 @@ import {
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { buildHardenedSdkOptions } from '../../sdk/hardened-options.js';
 import { describeObserverOutputShape, formatEmptyOutputReason } from '../../sdk/output-classifier.js';
-import { ClassifiedProviderError } from './provider-errors.js';
+import { ClassifiedProviderError, isClassified } from './provider-errors.js';
 import { resolveSummaryTierModel, resolveTierAlias } from './model-aliases.js';
 import { accumulateClaudeUsage, observerUsageLogFields } from './observer-usage.js';
 import {
@@ -45,7 +45,7 @@ import { resolveContextWindowTokens, observationFieldMaxChars } from './context-
 import { recycleObserverConversation, loadSessionStartContext, openObserverGeneration } from './session/recycle-conversation.js';
 import { ObserverResponsePacer } from './session/response-pacer.js';
 import { IDLE_TIMEOUT_MS } from './SessionMessageBuffer.js';
-import { optimizeObservationFields, buildFieldCompressionPrompt, type FieldCompressor } from './field-optimizer.js';
+import { optimizeObservationFields, buildFieldCompressionPrompt, type CompressedField, type FieldCompressor } from './field-optimizer.js';
 import { resolveFieldOptimizeTimeoutMs } from './retry.js';
 import { buildTelegramWrapupPrompt, type TelegramWrapupFormatterInput } from '../integrations/TelegramWrapupNotifier.js';
 import { telemetryBuffer } from '../telemetry/buffer.js';
@@ -67,23 +67,43 @@ export function __resetEffortHintLatchForTesting(): void {
 }
 
 /**
+ * A process launch that failed: Node's spawn error (code ENOENT/EINVAL, a
+ * spawn syscall) or the same failure carried in a wrapping message
+ * ("spawn claude ENOENT", "Failed to spawn …: spawn EINVAL"). An ENOENT from a
+ * file read is not one.
+ */
+function isSpawnFailure(error: unknown): boolean {
+  for (const candidate of [error, (error as { cause?: unknown } | null)?.cause]) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const { code, syscall, message } = candidate as { code?: unknown; syscall?: unknown; message?: unknown };
+    if ((code === 'ENOENT' || code === 'EINVAL') && typeof syscall === 'string' && syscall.startsWith('spawn')) return true;
+    if (typeof message === 'string' && /\bspawn\b.*\b(ENOENT|EINVAL)\b/.test(message)) return true;
+  }
+  return false;
+}
+
+/**
  * Classify a ClaudeProvider error (executable spawn failures, SDK errors,
  * Anthropic API errors). Provider-specific because it relies on:
  *   - SDK error class names (e.g. OverloadedError) when present
- *   - spawn errors (ENOENT) when the Claude executable is missing
+ *   - spawn errors (ENOENT/EINVAL) when the executable is missing or is a
+ *     Windows .cmd/.bat shim the SDK cannot launch without a shell
  *   - Anthropic-specific message strings ("Invalid API key", "Prompt is too long")
  */
 export function classifyClaudeError(err: unknown): ClassifiedProviderError {
   const message = err instanceof Error ? err.message : String(err);
   const errAny = err as { name?: string; status?: number; error?: { type?: string }; body?: unknown };
 
-  // Executable / spawn issues — unrecoverable, no point retrying.
+  // Executable / spawn issues — unrecoverable, no point retrying. EINVAL is the
+  // shape modern Node raises when the SDK spawns a Windows .cmd/.bat shim
+  // (e.g. a codex or uv shim reached via CLAUDE_CODE_PATH) without a shell.
   if (
     message.includes('Claude executable not found') ||
     message.includes('Every Claude CLI found is too old') ||
     message.includes('CLAUDE_CODE_PATH') ||
     (message.includes('desktop app') && message.includes('headless mode')) ||
     message.includes('ENOENT') ||
+    message.includes('EINVAL') ||
     message.startsWith('spawn ')
   ) {
     return new ClassifiedProviderError(message, { kind: 'setup_required', cause: err });
@@ -264,6 +284,29 @@ export class ClaudeProvider {
     }
   }
 
+  /**
+   * Classify a thrown provider error and rethrow. A setup_required failure (a
+   * missing or unspawnable executable) is recorded and rethrown as the
+   * classified error so SessionRoutes reports it once and skips future Claude
+   * starts until it is repaired; every other error keeps its original shape so
+   * genuine bugs still reach exception capture. `executablePath` is the resolved
+   * path a spawn failure could not launch — carried on the error and status so
+   * the setup-recheck gate does not re-run a query against the same shim.
+   */
+  private recordAndThrowClassified(error: unknown, executablePath?: string): never {
+    // Already classified (an observer-dir failure carries its own code): keep it.
+    if (isClassified(error)) throw error;
+    const err = error instanceof Error ? error : new Error(String(error));
+    const classified = classifyClaudeError(err);
+    if (classified.kind === 'setup_required') {
+      recordClaudeCliSetupRequired(classified.message, executablePath);
+      throw executablePath
+        ? new ClassifiedProviderError(classified.message, { kind: 'setup_required', cause: err, executablePath })
+        : classified;
+    }
+    throw err;
+  }
+
   async startSession(session: ActiveSession, worker?: WorkerRef): Promise<void> {
     const cwdTracker = { lastCwd: undefined as string | undefined };
     const observerExtraArgs = ['--no-session-persistence'];
@@ -275,13 +318,7 @@ export class ClaudeProvider {
       clearDependencyStatus('claude_cli');
       clearClaudeCliSelfHealAttempts();
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      const classified = classifyClaudeError(err);
-      if (classified.kind === 'setup_required') {
-        recordClaudeCliSetupRequired(classified.message);
-        throw classified;
-      }
-      throw err;
+      this.recordAndThrowClassified(error);
     }
 
     const modelId = session.modelOverride || this.getModelId();
@@ -395,6 +432,14 @@ export class ClaudeProvider {
       let turnEmptyOutputReason: string | undefined;
       // One re-queue per generator pass for a batch a failed turn never read.
       let retriedAfterErrorResult = false;
+      // #3664: whether any assistant frame of the current turn reported input,
+      // and the rows the turn stored. A gateway that synthesizes streaming
+      // reports zero input on every frame, so the session counters and the
+      // stored discovery_tokens miss the input; the turn's result message
+      // carries the real usage, applied at the turn boundary below.
+      let turnReportedInput = false;
+      let turnInsertedObservationIds: number[] = [];
+      let turnSummaryId: number | null = null;
       // The MEMORY_ID_CAPTURED/CHANGED line is a spawn-health signal for log
       // monitors, but the id arrives on the SDK's first system frame — before
       // any output is classified — so a spawn that only ever returns auth or
@@ -521,6 +566,7 @@ export class ClaudeProvider {
           const usage = message.message.usage;
           if (usage) {
             accumulateClaudeUsage(session, usage);
+            if (computeFullContextTokens(usage) > 0) turnReportedInput = true;
 
             // Real per-response usage for telemetry (tokens_input includes the
             // full context the model read: fresh + cache writes + cache reads).
@@ -572,7 +618,7 @@ export class ClaudeProvider {
 
           pacer.processingStarted();
           try {
-            await processAgentResponse(
+            const stored = await processAgentResponse(
               textContent,
               session,
               this.dbManager,
@@ -586,6 +632,10 @@ export class ClaudeProvider {
               activeResponseContext.current,
               emptyOutputReason
             );
+            if (stored) {
+              turnInsertedObservationIds.push(...(stored.insertedObservationIds ?? []));
+              turnSummaryId = stored.summaryId ?? turnSummaryId;
+            }
           } finally {
             pacer.processingFinished();
           }
@@ -617,6 +667,34 @@ export class ClaudeProvider {
           if (resultUsage && session.lastGeneratorSource !== 'init') {
             session.lastContextTokens = computeFullContextTokens(resultUsage);
           }
+          // No frame of this turn reported input, yet the turn read some: an
+          // SSE-synthesizing gateway (#3664). Count the input the frames left
+          // out, moving the baseline with it so the next response's discovery
+          // delta stays its own, and give the rows this turn inserted the
+          // turn's real cost (fresh input + cache writes + output, the basis
+          // the frames normally give).
+          if (resultUsage && !turnReportedInput) {
+            const missedInput = (resultUsage.input_tokens || 0) + (resultUsage.cache_creation_input_tokens || 0);
+            if (missedInput > 0) {
+              session.cumulativeInputTokens += missedInput;
+              discoveryTokenBaseline += missedInput;
+              if (resultUsage.cache_read_input_tokens) {
+                session.cumulativeCacheReadTokens =
+                  (session.cumulativeCacheReadTokens ?? 0) + resultUsage.cache_read_input_tokens;
+              }
+              if (turnInsertedObservationIds.length > 0 || turnSummaryId !== null) {
+                this.dbManager.getSessionStore().updateDiscoveryTokens(
+                  turnInsertedObservationIds,
+                  turnSummaryId,
+                  missedInput + (resultUsage.output_tokens || 0),
+                );
+              }
+            }
+          }
+          turnReportedInput = false;
+          turnInsertedObservationIds = [];
+          turnSummaryId = null;
+
           const totalCostUsd = (message as any).total_cost_usd as number | undefined;
           let turnCostUsd: number | undefined;
           if (typeof totalCostUsd === 'number') {
@@ -700,6 +778,16 @@ export class ClaudeProvider {
           pacer.answer();
         }
       }
+    } catch (error) {
+      // A missing binary (ENOENT) or a Windows .cmd/.bat shim that cannot be
+      // launched without a shell (EINVAL) surfaces here as a raw spawn error.
+      // Left unclassified it is a generic failure, retried on every later
+      // observation; classified, the setup problem is reported once, like the
+      // findClaudeExecutable guard at the top of startSession. The resolved path
+      // goes with it, so the recheck gate does not re-run the same file. Any
+      // other error keeps its own shape.
+      if (isSpawnFailure(error)) this.recordAndThrowClassified(error, claudePath);
+      throw error;
     } finally {
       // Whatever ended the stream (throw, quota break, abort), nothing will
       // answer the feed's last prompt any more.
@@ -789,8 +877,9 @@ export class ClaudeProvider {
     modelId: string,
     claudePath: string,
     signal: AbortSignal,
-  ): Promise<string | null> {
-    return this.runStandaloneObserverPrompt(
+  ): Promise<CompressedField | null> {
+    // The CLI reports no finish reason, so a reply it returns counts as whole.
+    const condensed = await this.runStandaloneObserverPrompt(
       buildFieldCompressionPrompt(text, budgetChars),
       {
         sessionDbId: session.sessionDbId,
@@ -801,6 +890,7 @@ export class ClaudeProvider {
       modelId,
       claudePath,
     );
+    return condensed ? { text: condensed, truncated: false } : null;
   }
 
   /** Format a stored summary through the same hardened Claude SDK path as summaries. */
@@ -834,7 +924,13 @@ export class ClaudeProvider {
   ): AsyncIterableIterator<SDKUserMessage> {
     const mode = ModeManager.getInstance().getActiveMode();
 
-    const isInitPrompt = session.lastPromptNumber === 1;
+    // Prompt 0 means no user_prompts row was ever written for this session
+    // (a transcript-ingested turn with no anchor). Treat it, like the genuine
+    // first prompt, as an init: a self-contained prompt the observer can act
+    // on — never a continuation that expects a resumed conversation it never
+    // had, which the model rejects as prose and the batch is then dropped
+    // (#3653).
+    const isInitPrompt = session.lastPromptNumber <= 1;
     logger.info('SDK', 'Creating message generator', {
       sessionDbId: session.sessionDbId,
       contentSessionId: session.contentSessionId,
@@ -919,6 +1015,7 @@ export class ClaudeProvider {
               { sessionDbId: session.sessionDbId, toolName: message.tool_name },
               fieldMaxChars,
               resolveFieldOptimizeTimeoutMs,
+              session.observerContextWindowTokens,
             )
           : { toolInput: message.tool_input, toolOutput: message.tool_response };
 

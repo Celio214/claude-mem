@@ -231,7 +231,7 @@ export function ContextSettingsModal({
           <div className="preview-column">
             <div className="preview-content">
               {error ? (
-                <div style={{ color: '#ff6b6b' }}>
+                <div style={{ color: 'var(--color-accent-error)' }}>
                   Error loading preview: {error}
                 </div>
               ) : (
@@ -349,7 +349,7 @@ export function ContextSettingsModal({
             >
               <FormField
                 label="AI Provider"
-                tooltip="Choose the provider that generates observations: Claude (via Agent SDK), Gemini (via REST API), OpenRouter (also used by the claude-mem observer), or any OpenAI-compatible endpoint"
+                tooltip="Choose the provider that generates observations: Claude (via Agent SDK), Gemini (via REST API), OpenRouter (also used by the claude-mem observer), Codex (your ChatGPT subscription), or any OpenAI-compatible endpoint"
               >
                 <select
                   value={formState.CLAUDE_MEM_PROVIDER || 'claude'}
@@ -358,6 +358,7 @@ export function ContextSettingsModal({
                   <option value="claude">Claude (uses your Claude account)</option>
                   <option value="gemini">Gemini (uses API key)</option>
                   <option value="openrouter">OpenRouter / claude-mem observer</option>
+                  <option value="codex">Codex (uses your ChatGPT subscription)</option>
                   <option value="openai-compatible">OpenAI-compatible endpoint (BYOK)</option>
                 </select>
               </FormField>
@@ -375,6 +376,20 @@ export function ContextSettingsModal({
                     <option value="sonnet">sonnet (balanced)</option>
                     <option value="opus">opus (highest quality)</option>
                   </select>
+                </FormField>
+              )}
+
+              {formState.CLAUDE_MEM_PROVIDER === 'codex' && (
+                <FormField
+                  label="Codex Model"
+                  tooltip="Optional model available through your Codex subscription; leave empty for the Codex default. Run codex login before starting the worker."
+                >
+                  <input
+                    type="text"
+                    value={formState.CLAUDE_MEM_CODEX_MODEL || ''}
+                    onChange={(e) => updateSetting('CLAUDE_MEM_CODEX_MODEL', e.target.value)}
+                    placeholder="Codex default (e.g. gpt-6-luna)"
+                  />
                 </FormField>
               )}
 
@@ -456,6 +471,24 @@ export function ContextSettingsModal({
                       readOnly={observerManagesBaseUrl}
                     />
                   </FormField>
+                  {!observerManagesBaseUrl && (
+                    <FormField
+                      label="Reasoning effort"
+                      tooltip="openrouter.ai models only. None turns reasoning off, for models that spend the output budget thinking. Default sends nothing."
+                    >
+                      <select
+                        value={formState.CLAUDE_MEM_OPENROUTER_REASONING_EFFORT || ''}
+                        onChange={(e) => updateSetting('CLAUDE_MEM_OPENROUTER_REASONING_EFFORT', e.target.value)}
+                      >
+                        <option value="">Model default</option>
+                        <option value="none">None (reasoning off)</option>
+                        <option value="minimal">Minimal</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                      </select>
+                    </FormField>
+                  )}
                   <FormField
                     label="Site URL (Optional)"
                     tooltip="Your site URL for OpenRouter analytics (optional)"

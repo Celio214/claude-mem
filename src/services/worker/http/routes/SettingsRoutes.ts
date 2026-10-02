@@ -15,6 +15,8 @@ import { clearPortCache } from '../../../../shared/worker-utils.js';
 import { snapshotDependencyHealth } from '../../../../shared/dependency-health.js';
 import { ensureSettingsDocument, updateSettingsDocument } from '../../../../shared/settings-document.js';
 import { isHttpUrl } from '../../../../shared/openrouter-base-url.js';
+import { OPENROUTER_REASONING_EFFORTS, parseOpenRouterReasoningEffort } from '../../OpenRouterProvider.js';
+import { CODEX_REASONING_EFFORTS, isCodexReasoningEffort } from '../../CodexProvider.js';
 
 const toggleMcpSchema = z.object({
   enabled: z.boolean(),
@@ -51,18 +53,39 @@ const SECRET_SETTING_KEYS = new Set([
   'CLAUDE_MEM_GROK_BOT_WEBHOOK_URL',
 ]);
 
-function maskSecretValue(value: unknown): unknown {
-  if (typeof value !== 'string' || value.length === 0) return value;
+function maskSecretString(value: string): string {
   if (value.length <= 4) return '*'.repeat(value.length);
   return `${'*'.repeat(value.length - 4)}${value.slice(-4)}`;
+}
+
+/**
+ * A secret as GET may show it, in every shape settings.json can hold: a string
+ * (a single key, or a comma/newline list, masked as a whole), an array (a key
+ * pool written as JSON: each entry masked), or anything else (hidden whole).
+ * Empty values stay as they are, so the viewer can tell "unset" apart.
+ */
+function maskSecretValue(value: unknown): unknown {
+  if (value === undefined || value === null || value === '') return value;
+  if (typeof value === 'string') return maskSecretString(value);
+  if (Array.isArray(value)) return value.map(entry => (typeof entry === 'string' ? maskSecretString(entry) : '****'));
+  return '****';
 }
 
 // Viewer save posts the GET body back unchanged. Treat a secret as untouched
 // only when the submitted value equals the mask of the currently stored
 // secret — not "any string starting with *", which would silently drop a
-// legitimate replacement key that happens to begin with '*'.
+// legitimate replacement key that happens to begin with '*'. Arrays compare
+// entry by entry, so a pool written as JSON survives a save too.
 function isUnchangedMaskedSecret(incoming: unknown, stored: unknown): boolean {
-  return typeof incoming === 'string' && incoming === maskSecretValue(stored);
+  if (incoming === undefined || incoming === null || incoming === '') return false;
+  return JSON.stringify(incoming) === JSON.stringify(maskSecretValue(stored));
+}
+
+/** The posted settings whose value differs from the one settings.json holds. */
+function settingsChangedBy(posted: Record<string, unknown>, onDisk: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(posted).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(onDisk[key])),
+  );
 }
 
 function redactSecretSettings<T extends object>(settings: T): T {
@@ -73,6 +96,21 @@ function redactSecretSettings<T extends object>(settings: T): T {
     }
   }
   return redacted as T;
+}
+
+/**
+ * The posted settings minus those that only echo an environment override: the
+ * variable is set, and the viewer sent back what GET showed for it (masked,
+ * for a secret). The environment is that value's only source, so a save
+ * neither checks nor writes it. Written, it would outlive the variable, and a
+ * masked secret would replace the stored key.
+ */
+function withoutEnvironmentEchoes(posted: Record<string, unknown>, settingsPath: string): Record<string, unknown> {
+  const shown = redactSecretSettings(SettingsDefaultsManager.loadFromFile(settingsPath)) as unknown as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.entries(posted).filter(([key, value]) =>
+      process.env[key] === undefined || JSON.stringify(value) !== JSON.stringify(shown[key])),
+  );
 }
 
 // Spawn-binary paths: file/env only. Even if a key is accidentally re-added to
@@ -165,7 +203,18 @@ export class SettingsRoutes extends BaseRouteHandler {
       return;
     }
 
-    const validation = this.validateSettings(req.body);
+    const settingsPath = paths.settings();
+
+    // The viewer posts every setting back, edited or not, as GET showed it:
+    // with environment overrides applied. Those echoes are dropped first. The
+    // rest is judged against settings.json itself, so only what this save
+    // changes is checked: a value hand-edited into the file that the worker
+    // already ignores (it falls back to the default) would otherwise fail
+    // every later save of an unrelated field.
+    const posted = withoutEnvironmentEchoes(req.body, settingsPath);
+    const validation = this.validateSettings(
+      settingsChangedBy(posted, SettingsDefaultsManager.loadFromFile(settingsPath, false) as unknown as Record<string, unknown>),
+    );
     if (!validation.valid) {
       res.status(400).json({
         success: false,
@@ -173,8 +222,6 @@ export class SettingsRoutes extends BaseRouteHandler {
       });
       return;
     }
-
-    const settingsPath = paths.settings();
 
     // Write whitelist. POST /api/settings has no authentication — the worker
     // trusts loopback — so any page that can reach this origin could set one
@@ -211,6 +258,7 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_OPENAI_COMPAT_PRESET',
       'CLAUDE_MEM_OPENAI_COMPAT_BASE_URL',
       'CLAUDE_MEM_OPENAI_COMPAT_MODEL',
+      'CLAUDE_MEM_OPENROUTER_REASONING_EFFORT',
       'CLAUDE_MEM_OBSERVER_CONTEXT_WINDOW',
       'CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS',
       'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER',
@@ -240,10 +288,10 @@ export class SettingsRoutes extends BaseRouteHandler {
     const result = updateSettingsDocument(settingsPath, {}, SettingsDefaultsManager.getAllDefaults(), target => {
       for (const key of settingKeys) {
         if (FILE_ONLY_SETTING_KEYS.has(key)) continue;
-        if (req.body[key] === undefined) continue;
+        if (posted[key] === undefined) continue;
         // The viewer posts GET's masked secret back unchanged: keep the stored value.
-        if (SECRET_SETTING_KEYS.has(key) && isUnchangedMaskedSecret(req.body[key], target[key])) continue;
-        target[key] = req.body[key];
+        if (SECRET_SETTING_KEYS.has(key) && isUnchangedMaskedSecret(posted[key], target[key])) continue;
+        target[key] = posted[key];
       }
 
       // Expand `~` on a CLAUDE_CODE_PATH that was already on disk (file/env).
@@ -282,6 +330,17 @@ export class SettingsRoutes extends BaseRouteHandler {
       if (settings[key] !== undefined && typeof settings[key] !== 'string') {
         return { valid: false, error: `${key} must be a string` };
       }
+    }
+
+    // An effort Codex does not know fails every Codex request, and the
+    // app-server takes any string. Like every rule here, it sees only the
+    // values this save changes (settingsChangedBy).
+    const codexEffort = settings.CLAUDE_MEM_CODEX_REASONING_EFFORT;
+    if (typeof codexEffort === 'string' && codexEffort.trim() && !isCodexReasoningEffort(codexEffort.trim())) {
+      return {
+        valid: false,
+        error: `CLAUDE_MEM_CODEX_REASONING_EFFORT must be empty (Codex's default) or one of: ${CODEX_REASONING_EFFORTS.join(', ')}`,
+      };
     }
 
     if (settings.CLAUDE_MEM_PROVIDER) {
@@ -426,6 +485,11 @@ export class SettingsRoutes extends BaseRouteHandler {
       if (!['narrative', 'facts'].includes(settings.CLAUDE_MEM_CONTEXT_FULL_FIELD)) {
         return { valid: false, error: 'CLAUDE_MEM_CONTEXT_FULL_FIELD must be "narrative" or "facts"' };
       }
+    }
+
+    if (settings.CLAUDE_MEM_OPENROUTER_REASONING_EFFORT
+      && !parseOpenRouterReasoningEffort(settings.CLAUDE_MEM_OPENROUTER_REASONING_EFFORT)) {
+      return { valid: false, error: `CLAUDE_MEM_OPENROUTER_REASONING_EFFORT must be empty or one of: ${OPENROUTER_REASONING_EFFORTS.join(', ')}` };
     }
 
     if (settings.CLAUDE_MEM_OPENROUTER_SITE_URL) {
